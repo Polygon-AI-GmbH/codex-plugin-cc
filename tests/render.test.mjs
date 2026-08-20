@@ -57,3 +57,61 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.match(output, /Codex session ID: thr_123/);
   assert.match(output, /Resume in Codex: codex resume thr_123/);
 });
+
+test("renderStoredJobResult keeps the review header for native review jobs", () => {
+  const output = renderStoredJobResult(
+    {
+      id: "review-456",
+      status: "completed",
+      title: "Codex Review",
+      jobClass: "review",
+      threadId: "thr_456"
+    },
+    {
+      threadId: "thr_456",
+      rendered: "# Codex Review\n\nTarget: working tree diff\n\nNo blocking issues found.\n",
+      result: {
+        review: "Review",
+        target: { label: "working tree diff" },
+        threadId: "thr_456",
+        codex: {
+          status: 0,
+          stderr: "",
+          stdout: "No blocking issues found."
+        }
+      }
+    }
+  );
+
+  assert.match(output, /^# Codex Review/);
+  assert.match(output, /Target: working tree diff/);
+  assert.match(output, /Codex session ID: thr_456/);
+  assert.match(output, /Resume in Codex: codex resume thr_456/);
+});
+
+test("renderStoredJobResult rebuilds the native review header when rendered output is missing", () => {
+  const output = renderStoredJobResult(
+    {
+      id: "review-789",
+      status: "completed",
+      title: "Codex Review",
+      jobClass: "review"
+    },
+    {
+      result: {
+        review: "Review",
+        target: { label: "branch diff against main" },
+        threadId: null,
+        codex: {
+          status: 0,
+          stderr: "",
+          stdout: "One minor issue."
+        }
+      }
+    }
+  );
+
+  assert.match(output, /^# Codex Review/);
+  assert.match(output, /Target: branch diff against main/);
+  assert.match(output, /One minor issue\./);
+});

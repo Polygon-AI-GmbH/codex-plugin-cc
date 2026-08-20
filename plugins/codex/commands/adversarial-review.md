@@ -36,9 +36,9 @@ Execution mode rules:
 
 Argument handling:
 - Preserve the user's arguments exactly.
-- Do not strip `--wait` or `--background` yourself.
+- Do not strip `--wait` or `--background` yourself. The one permitted addition: in the Background flow, append `--background` inside the quoted argument string when the raw arguments do not already include it, so the companion script detaches instead of running in the foreground. It must stay inside the quotes — the companion only splits a single quoted argument string, so a flag appended outside the quotes breaks parsing of the other flags.
 - Do not weaken the adversarial framing or rewrite the user's focus text.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- The companion script detaches itself when `--background` is passed and prints a queued job id; `--wait` (or no flag) runs in the foreground. `Bash(..., run_in_background: true)` still keeps the launch itself off the conversation thread.
 - `/codex:adversarial-review` uses the same review target selection as `/codex:review`.
 - It supports working-tree review, branch review, and `--base <ref>`.
 - It does not support `--scope staged` or `--scope unstaged`.
@@ -54,13 +54,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$AR
 - Do not fix any issues mentioned in the review output.
 
 Background flow:
-- Launch the review with `Bash` in the background:
+- Launch the review with `Bash` in the background, appending `--background` inside the quoted argument string unless the raw arguments already include it:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"`,
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS --background"`,
   description: "Codex adversarial review",
   run_in_background: true
 })
 ```
 - Do not call `BashOutput` or wait for completion in this turn.
-- After launching the command, tell the user: "Codex adversarial review started in the background. Check `/codex:status` for progress."
+- After launching the command, tell the user: "Codex adversarial review started in the background. Check `/codex:status` for progress, then fetch the findings with `/codex:result <jobId>` (job id from `/codex:status`) once it completes."

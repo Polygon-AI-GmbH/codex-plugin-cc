@@ -33,9 +33,9 @@ Execution mode rules:
 
 Argument handling:
 - Preserve the user's arguments exactly.
-- Do not strip `--wait` or `--background` yourself.
+- Do not strip `--wait` or `--background` yourself. The one permitted addition: in the Background flow, append `--background` inside the quoted argument string when the raw arguments do not already include it, so the companion script detaches instead of running in the foreground. It must stay inside the quotes — the companion only splits a single quoted argument string, so a flag appended outside the quotes breaks parsing of the other flags.
 - Do not add extra review instructions or rewrite the user's intent.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- The companion script detaches itself when `--background` is passed and prints a queued job id; `--wait` (or no flag) runs in the foreground. `Bash(..., run_in_background: true)` still keeps the launch itself off the conversation thread.
 - `/codex:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
 - If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
 
@@ -49,13 +49,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"
 - Do not fix any issues mentioned in the review output.
 
 Background flow:
-- Launch the review with `Bash` in the background:
+- Launch the review with `Bash` in the background, appending `--background` inside the quoted argument string unless the raw arguments already include it:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"`,
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS --background"`,
   description: "Codex review",
   run_in_background: true
 })
 ```
 - Do not call `BashOutput` or wait for completion in this turn.
-- After launching the command, tell the user: "Codex review started in the background. Check `/codex:status` for progress."
+- After launching the command, tell the user: "Codex review started in the background. Check `/codex:status` for progress, then fetch the findings with `/codex:result <jobId>` (job id from `/codex:status`) once it completes."

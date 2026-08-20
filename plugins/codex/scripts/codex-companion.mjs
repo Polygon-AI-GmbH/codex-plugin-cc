@@ -681,21 +681,63 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
+function markBackgroundLaunchFailure(job, queuedRecord, logFile, error) {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+  appendLogLine(logFile, `Failed to launch background worker: ${errorMessage}`);
+  const failurePatch = {
+    id: job.id,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage,
+    completedAt: nowIso()
+  };
+  writeJobFile(job.workspaceRoot, job.id, {
+    ...(readStoredJob(job.workspaceRoot, job.id) ?? queuedRecord),
+    ...failurePatch
+  });
+  upsertJob(job.workspaceRoot, failurePatch);
+}
+
 function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  let child;
+  try {
+    child = spawnDetachedTaskWorker(cwd, job.id);
+  } catch (error) {
+    markBackgroundLaunchFailure(job, queuedRecord, logFile, error);
+    throw error;
+  }
+  child.on("error", (error) => {
+    markBackgroundLaunchFailure(job, queuedRecord, logFile, error);
+  });
+  if (child.pid === undefined) {
+    const error = new Error("Failed to spawn the background task worker.");
+    markBackgroundLaunchFailure(job, queuedRecord, logFile, error);
+    throw error;
+  }
+
+  const storedJob = readStoredJob(job.workspaceRoot, job.id);
+  if (!storedJob || storedJob.status === "queued") {
+    writeJobFile(job.workspaceRoot, job.id, {
+      ...(storedJob ?? queuedRecord),
+      pid: child.pid
+    });
+    upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid });
+  }
 
   return {
     payload: {
@@ -709,6 +751,12 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+function launchBackgroundJob(cwd, job, request, options) {
+  ensureCodexAvailable(cwd);
+  const { payload } = enqueueBackgroundTask(cwd, job, request);
+  outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+}
+
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "cwd"],
@@ -717,6 +765,10 @@ async function handleReviewCommand(argv, config) {
       m: "model"
     }
   });
+
+  if (options.wait && options.background) {
+    throw new Error("Choose either --wait or --background.");
+  }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -736,16 +788,25 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
+  const request = {
+    cwd,
+    base: target.baseRef ?? null,
+    scope: target.mode,
+    model: options.model,
+    focusText,
+    reviewName: config.reviewName
+  };
+
+  if (options.background) {
+    launchBackgroundJob(cwd, job, request, options);
+    return;
+  }
+
   await runForegroundCommand(
     job,
     (progress) =>
       executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
+        ...request,
         onProgress: progress
       }),
     { json: options.json }
@@ -786,7 +847,6 @@ async function handleTask(argv) {
   });
 
   if (options.background) {
-    ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
@@ -799,8 +859,7 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    launchBackgroundJob(cwd, job, request, options);
     return;
   }
 
@@ -853,9 +912,10 @@ async function handleTaskWorker(argv) {
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+    throw new Error(`Stored job ${options["job-id"]} is missing its request payload.`);
   }
 
+  const execute = storedJob.jobClass === "review" ? executeReviewRun : executeTaskRun;
   const { logFile, progress } = createTrackedProgress(
     {
       ...storedJob,
@@ -872,7 +932,7 @@ async function handleTaskWorker(argv) {
       logFile
     },
     () =>
-      executeTaskRun({
+      execute({
         ...request,
         onProgress: progress
       }),

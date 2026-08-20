@@ -81,6 +81,20 @@ function isStructuredReviewStoredResult(storedJob) {
   );
 }
 
+function isNativeReviewStoredResult(storedJob) {
+  const result = storedJob?.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return false;
+  }
+  if (isStructuredReviewStoredResult(storedJob)) {
+    return false;
+  }
+  return (
+    Object.prototype.hasOwnProperty.call(result, "review") &&
+    Object.prototype.hasOwnProperty.call(result, "codex")
+  );
+}
+
 function formatJobLine(job) {
   const parts = [job.id, `${job.status || "unknown"}`];
   if (job.kindLabel) {
@@ -392,6 +406,28 @@ export function renderStoredJobResult(job, storedJob) {
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
+    if (!threadId) {
+      return output;
+    }
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+  }
+
+  if (isNativeReviewStoredResult(storedJob)) {
+    const rendered =
+      storedJob.rendered ??
+      renderNativeReviewResult(
+        {
+          status: storedJob.result.codex?.status ?? 0,
+          stdout: storedJob.result.codex?.stdout ?? "",
+          stderr: storedJob.result.codex?.stderr ?? ""
+        },
+        {
+          reviewLabel: storedJob.result.review ?? "Review",
+          targetLabel: storedJob.result.target?.label ?? "unknown target",
+          reasoningSummary: storedJob.result.codex?.reasoning ?? null
+        }
+      );
+    const output = rendered.endsWith("\n") ? rendered : `${rendered}\n`;
     if (!threadId) {
       return output;
     }
