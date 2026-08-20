@@ -1,5 +1,14 @@
 # Codex plugin for Claude Code
 
+> **Polygon-AI fork** of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc)
+> (marketplace `polygon-codex`), tracking upstream and carrying fixes not yet merged there.
+> Install: `/plugin marketplace add Polygon-AI-GmbH/codex-plugin-cc`
+>
+> **Migrating from upstream?** Uninstall `codex@openai-codex` first. The marketplace rename
+> re-keys the plugin state directory (`~/.claude/plugins/data/codex-openai-codex` →
+> `codex-polygon-codex`), so setup toggles and job history reset under the new key: let any
+> in-flight background jobs finish before switching, then re-run `/codex:setup` options after.
+
 Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
 
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
@@ -24,14 +33,17 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add Polygon-AI-GmbH/codex-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install codex@polygon-codex
 ```
+
+If you previously used the upstream marketplace, uninstall `codex@openai-codex` first (see the
+migration note at the top of this README).
 
 Reload plugins:
 
