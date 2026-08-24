@@ -6,7 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { ensureStateDir, resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -87,8 +87,11 @@ export function loadBrokerSession(cwd) {
 }
 
 export function saveBrokerSession(cwd, session) {
-  const stateDir = resolveStateDir(cwd);
-  fs.mkdirSync(stateDir, { recursive: true });
+  // Via ensureStateDir, not a bare mkdirSync: this runs BEFORE any job on the
+  // first-run path (/codex:setup -> getCodexAuthStatus -> ensureBrokerSession),
+  // so a modeless mkdir here created the whole state tree 0755 and left every
+  // later `mode: 0o700` inert — mkdirSync ignores mode for an existing dir.
+  ensureStateDir(cwd);
   fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
 }
 
