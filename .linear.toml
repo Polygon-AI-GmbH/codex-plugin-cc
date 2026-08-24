@@ -1,0 +1,3 @@
+workspace = "internal-tooling"
+team_id = "INT"
+issue_sort = "priority"
