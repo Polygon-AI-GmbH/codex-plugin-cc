@@ -56,14 +56,47 @@ export async function sendBrokerShutdown(endpoint) {
   });
 }
 
+// Announced, never silent — the same policy as the watchdog's. A broker that
+// failed to start costs every later command a full `waitForBrokerEndpoint`
+// timeout before falling back, and without this line nothing in stderr or the
+// broker log says why.
+function warnBrokerSpawnFailed(error) {
+  try {
+    process.stderr.write(
+      `[codex] broker process failed to start (${error?.code ?? error}); ` +
+        `falling back to a direct codex app-server\n`
+    );
+  } catch {
+    // stderr is gone too. Nothing useful left to do.
+  }
+}
+
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
-    cwd,
-    env,
-    detached: true,
-    stdio: ["ignore", logFd, logFd]
-  });
+  // Same rule as the watchdog in app-server.mjs, and it needs BOTH halves,
+  // because node splits spawn failures across two mechanisms. EACCES, EAGAIN,
+  // EMFILE, ENFILE and ENOENT are deferred to an async `error` event; every
+  // other errno — fork ENOMEM, ENOTDIR, ENAMETOOLONG on `scriptPath` — throws
+  // synchronously. Unhandled, the async half becomes an uncaughtException
+  // (the sole caller immediately awaits `waitForBrokerEndpoint`, so the loop is
+  // live) and the sync half escapes past two callers that have no try, taking
+  // the companion down; either way it skips the `closeSync` below and leaks the
+  // log fd on every attempt. Both paths instead fall through to the
+  // direct-spawn path `connect()` already handles when the endpoint is null.
+  let child;
+  try {
+    child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
+      cwd,
+      env,
+      detached: true,
+      stdio: ["ignore", logFd, logFd]
+    });
+  } catch (error) {
+    fs.closeSync(logFd);
+    warnBrokerSpawnFailed(error);
+    return null;
+  }
+  child.on("error", warnBrokerSpawnFailed);
   child.unref();
   fs.closeSync(logFd);
   return child;
@@ -149,14 +182,18 @@ export async function ensureBrokerSession(cwd, options = {}) {
     env: options.env ?? process.env
   });
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  // `child` is null when the spawn failed outright; skip the 2s wait for a
+  // broker that was never started, but still tear the session dir down.
+  const ready = child
+    ? await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000)
+    : false;
   if (!ready) {
     teardownBrokerSession({
       endpoint,
       pidFile,
       logFile,
       sessionDir,
-      pid: child.pid ?? null,
+      pid: child?.pid ?? null,
       killProcess: options.killProcess ?? null
     });
     return null;

@@ -31,6 +31,7 @@ import { terminateProcessTree } from "./process.mjs";
  * @type {Set<import("node:child_process").ChildProcess>}
  */
 const liveAppServers = new Set();
+const liveWatchdogs = new Set();
 let reaperInstalled = false;
 
 function reapLiveAppServers() {
@@ -61,36 +62,121 @@ function reapLiveAppServers() {
  * handlers alone, a SIGKILL'd parent still left the app-server running; with
  * this watchdog it does not.
  *
- * Deliberately `sh`, not another node: it must cost nothing to keep around for
- * the lifetime of a long job.
+ * **It blocks on EOF rather than polling.** The guard's stdin is a pipe whose
+ * write end only we hold. Any death of ours — SIGKILL included — closes every
+ * fd we own, `read` sees EOF, and the group dies within milliseconds. The
+ * earlier `while kill -0 $parent; do sleep 1; done` form cost a fork of
+ * `/bin/sleep` every second for the life of a 20-40 minute job (~2400 of them),
+ * fired up to a second late, and could miss the death entirely if the parent's
+ * pid was recycled inside a poll interval — leaking exactly the orphan this
+ * exists to prevent. `read` and `kill` are both shell builtins, so the guard
+ * also needs no PATH at all; `sleep` was the only reason it ever did.
+ *
+ * `sh`, not another node: it must cost nothing to keep around for a long job.
+ *
+ * The PATH rule here is not file-wide — `initialize()` deliberately resolves
+ * bare `codex` through the caller's PATH, which is the point of that spawn. The
+ * rule is: an INFRASTRUCTURE spawn (this guard, the broker) names an absolute
+ * interpreter and passes its own environment, and EVERY spawn, infrastructure
+ * or not, handles the async `error` event. That second half is what bit:
+ * ENOENT/EACCES/EAGAIN/EMFILE/ENFILE are deferred to an `error` event, so the
+ * try/catch below never saw `spawn("sh")` fail under a restricted PATH; it
+ * surfaced as an uncaughtException and killed the companion. The try/catch is
+ * still load-bearing — ENOTDIR, ENAMETOOLONG and fork ENOMEM throw
+ * synchronously — so both paths are needed, not either one.
  *
  * @param {number} childPid
  * @returns {import("node:child_process").ChildProcess | null}
  */
-function spawnParentDeathWatchdog(childPid) {
+export function spawnParentDeathWatchdog(childPid) {
   if (process.platform === "win32") {
     return null;   // no process groups; terminateProcessTree covers cleanup there
   }
+  // A failed `spawn("codex")` leaves pid undefined, and on that path `exit`
+  // never fires — so nothing would ever kill a guard we started, and it would
+  // sit there for the whole companion lifetime holding a pipe.
+  // `> 1`, not merely finite: `kill -9 -1` is POSIX for "every process this uid
+  // may signal", so a pid of 1 would turn the guard into a session killer. No
+  // production path can produce it — `spawn()` never returns pid 1 — but this
+  // function is exported now, and the cost of the guard being wrong here is the
+  // developer's whole desktop session.
+  if (!Number.isInteger(childPid) || childPid <= 1) {
+    return null;
+  }
+  let guard;
   try {
-    const guard = spawn(
-      "sh",
+    guard = spawn(
+      "/bin/sh",
       [
         "-c",
-        // Poll our pid, then kill the child's whole GROUP. `kill -0` is a
-        // permission check, not a signal, so this is cheap.
-        `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done; ` +
+        // Blocks until our end of the pipe closes, then kills the child's whole
+        // GROUP, falling back to the bare pid if it leads no group.
+        `read -r _ 2>/dev/null; ` +
           `kill -9 -${childPid} 2>/dev/null || kill -9 ${childPid} 2>/dev/null`
       ],
-      { stdio: "ignore", detached: true }
+      { stdio: ["pipe", "ignore", "ignore"], detached: true, env: {} }
     );
-    guard.unref();          // must not hold OUR event loop open
-    return guard;
-  } catch {
+  } catch (error) {
+    warnWatchdogUnavailable(error);
     return null;            // best-effort: the in-process reaper still applies
+  }
+  // Async spawn/exec failures land here, not in the catch. Announced rather
+  // than swallowed: losing this guard silently removes the ONLY cleanup that
+  // survives SIGKILL, and the next orphan report would have nothing to
+  // correlate against.
+  guard.on("error", warnWatchdogUnavailable);
+  // The pipe is a lifetime signal, never written to. A listener so that an
+  // EPIPE (the guard died first) cannot become an unhandled stream error.
+  guard.stdin?.on("error", () => {});
+  guard.stdin?.unref();
+  guard.unref();            // must not hold OUR event loop open
+  // Registered HERE, not at the call site, so every caller gets retention by
+  // construction and releases it through `releaseParentDeathWatchdog`.
+  //
+  // DEFENSIVE, and honestly so: the pipe is the lifetime signal, so a collected
+  // ChildProcess could in principle have its stdin finalized and kill a healthy
+  // app-server. A hand-inlined guard with no reference DOES die that way under
+  // forced GC — but through this function I could not reproduce it (forced
+  // `global.gc()`, heap churn, and both together all left the child alive), so
+  // something already keeps the handle reachable. The Set costs one Set entry
+  // per client and makes the guarantee explicit instead of incidental; do not
+  // remove it on the grounds that no test fails, because no test can currently
+  // tell the difference.
+  liveWatchdogs.add(guard);
+  return guard;
+}
+
+/**
+ * Stop a guard and drop the retention `spawnParentDeathWatchdog` took.
+ *
+ * The counterpart to the `liveWatchdogs.add` above: without an exported release
+ * the Set would pin one ChildProcess — and one open socketpair fd — per call,
+ * for the lifetime of the process.
+ *
+ * @param {import("node:child_process").ChildProcess | null} guard
+ */
+export function releaseParentDeathWatchdog(guard) {
+  if (!guard) return;
+  try {
+    guard.kill("SIGKILL");
+  } catch {
+    // Already gone; it exits on its own once we do.
+  }
+  liveWatchdogs.delete(guard);
+}
+
+function warnWatchdogUnavailable(error) {
+  try {
+    process.stderr.write(
+      `[codex] parent-death watchdog unavailable (${error?.code ?? error}); ` +
+        `an app-server may outlive a SIGKILL of this process\n`
+    );
+  } catch {
+    // stderr is gone too. Nothing useful left to do.
   }
 }
 
-function installReaper() {
+export function installReaper() {
   if (reaperInstalled) {
     return;
   }
@@ -107,11 +193,15 @@ function installReaper() {
       process.kill(process.pid, signal);
     });
   }
-  // A crash must not leak either; rethrow after cleaning up.
-  process.on("uncaughtException", (error) => {
-    reapLiveAppServers();
-    throw error;
-  });
+  // NO `uncaughtException` handler. `process.on("exit")` above ALREADY runs on
+  // an uncaught exception, so one is redundant for OUR reaping — and the
+  // rethrowing form this file used to carry had two costs beyond that. It DID
+  // reap (its first statement ran) but the rethrow made the exit code 7,
+  // `Internal Exception Handler Run-Time Failure`, instead of 1, and installing
+  // any uncaughtException listener SUPPRESSES every `exit` listener, so any
+  // future cleanup hung there would silently stop running on the crash path.
+  // Verified on node v26.7.0 both ways. The exit-7 conversion is also how a
+  // stray spawn error in the watchdog above could kill this process at all.
 }
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -301,14 +391,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.watchdog = spawnParentDeathWatchdog(this.proc.pid);
     this.proc.once("exit", () => {
       liveAppServers.delete(this.proc);
-      if (this.watchdog) {
-        try {
-          this.watchdog.kill("SIGKILL");
-        } catch {
-          // Already gone; it exits on its own once we do.
-        }
-        this.watchdog = null;
-      }
+      releaseParentDeathWatchdog(this.watchdog);
+      this.watchdog = null;
     });
 
     this.proc.stdout.setEncoding("utf8");
