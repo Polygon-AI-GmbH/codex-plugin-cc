@@ -13,7 +13,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { ensureBrokerSession, isBrokerEndpointReady, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 /**
@@ -176,7 +176,15 @@ function warnWatchdogUnavailable(error) {
   }
 }
 
-export function installReaper() {
+/**
+ * @param {{ signals?: boolean }} [options] `signals: false` installs only the
+ *   `exit` reaper. The signal handlers below SIGKILL the child group and
+ *   re-raise, which is right for a dispatcher but wrong for the broker: it
+ *   owns its child's lifecycle through its own graceful `terminate`, and the
+ *   re-raise killed it before that ever ran, leaving its socket and pid file
+ *   behind. Latched on first call like the rest, so a process must decide once.
+ */
+export function installReaper({ signals = true } = {}) {
   if (reaperInstalled) {
     return;
   }
@@ -184,6 +192,9 @@ export function installReaper() {
   // `exit` is synchronous-only, which is exactly why the kill above uses the
   // sync `process.kill` rather than anything awaited.
   process.on("exit", reapLiveAppServers);
+  if (!signals) {
+    return;
+  }
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => {
       reapLiveAppServers();
@@ -375,7 +386,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    installReaper();
+    installReaper({ signals: this.options.reapOnSignal !== false });
     this.proc = spawn("codex", ["app-server"], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
@@ -550,7 +561,12 @@ export class CodexAppServerClient {
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+        // Never dial a recorded endpoint blind: a broker that exited on its own
+        // can leave its record behind, and `getCodexAuthStatus` then reported
+        // "connect ENOENT" as logged-out. A dead record means no broker, which
+        // is the direct-spawn path below.
+        const recorded = loadBrokerSession(cwd)?.endpoint ?? null;
+        brokerEndpoint = recorded && (await isBrokerEndpointReady(recorded)) ? recorded : null;
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });

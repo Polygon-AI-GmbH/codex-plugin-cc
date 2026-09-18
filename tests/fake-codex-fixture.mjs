@@ -3,6 +3,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { writeExecutable } from "./helpers.mjs";
+import { BROKER_IDLE_MS_ENV } from "../plugins/codex/scripts/lib/broker-watchdog.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -272,7 +273,28 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+// Recorded so a test can assert this process DIES with whatever spawned it.
+// The broker orphan tests need it: an app-server that outlives its broker is
+// the leak, and there is no other way to name the child from outside. Appended,
+// not overwritten: a client that respawns records every child it started.
+bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 saveState(bootState);
+
+// An app-server that will not go quietly: ignores SIGTERM and stays up for a
+// while after its stdin closes. Only the spawner's SIGKILL escalation ends it
+// inside a test's window, which is what makes "the child died with the broker"
+// a real assertion. SIGTERM receipt is recorded so a test can prove the
+// graceful close was attempted before the escalation.
+if (BEHAVIOR === "stubborn-app-server") {
+  process.on("SIGTERM", () => {
+    const state = loadState();
+    state.appServerSigterms = (state.appServerSigterms || 0) + 1;
+    saveState(state);
+  });
+  process.stdin.on("end", () => {
+    setTimeout(() => process.exit(0), 5000);
+  });
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -647,12 +669,21 @@ rl.on("line", (line) => {
     const cmdWrapper = `@echo off\r\nnode "%~dp0codex" %*\r\n`;
     fs.writeFileSync(path.join(binDir, "codex.cmd"), cmdWrapper, { encoding: "utf8" });
   }
+  return statePath;
+}
+
+/** The fixture's recorded state, or `{}` before the fake has booted. */
+export function readFakeCodexState(statePath) {
+  return fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : {};
 }
 
 export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    // 20s, not the 30min default: a broker a crashed test leaves behind reaps
+    // itself long before anyone notices. Callers spread over this to override.
+    [BROKER_IDLE_MS_ENV]: "20000"
   };
 }

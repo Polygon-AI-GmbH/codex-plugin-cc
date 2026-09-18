@@ -19,7 +19,7 @@ const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 // directory that already exists, and mkdirSync follows symlinks (both verified).
 // assertSafeFallbackRoot is what actually closes that, and ensureStateDir is the
 // single place that calls it.
-function fallbackStateRoot() {
+export function fallbackStateRoot() {
   return path.join(os.tmpdir(), `codex-companion-${process.getuid?.() ?? "shared"}`);
 }
 
@@ -100,6 +100,41 @@ function hostileRootError(root, detail) {
   );
 }
 
+// Windows has no POSIX modes or uids: Node reports synthesized bits such as
+// 0777 for an ordinary directory, so the mode test would reject the plugin's
+// own fallback on every command after the one that created it. There
+// os.tmpdir() is the per-user %TEMP%, which is what provides the isolation.
+function isPrivateDir(root, forbiddenModeBits) {
+  let stats;
+  try {
+    stats = fs.lstatSync(root);
+  } catch {
+    return false;
+  }
+  const posix = process.platform !== "win32" && process.getuid !== undefined;
+  return (
+    !stats.isSymbolicLink() &&
+    stats.isDirectory() &&
+    !(posix && stats.uid !== process.getuid()) &&
+    !(posix && (stats.mode & forbiddenModeBits) !== 0)
+  );
+}
+
+/**
+ * Read-path twin of `assertSafeFallbackRoot`: may the records under `root` be
+ * trusted? Never throws and never creates anything.
+ *
+ * The SessionStart sweep unlinks whatever paths a `broker.json` names, so a
+ * root someone else can write into is a root whose records must not be acted
+ * on. The mask is 0o022 (group/other WRITE), not the write path's 0o077: that
+ * one also forbids group/other READ, which protects the job files we are about
+ * to write there, and a `<plugin-data>/state` created 0755 by a build before
+ * 1.0.8 would otherwise turn the sweep off silently on every upgraded install.
+ */
+export function isSafeStateRoot(root) {
+  return isPrivateDir(root, 0o022);
+}
+
 function assertSafeFallbackRoot() {
   const root = fallbackStateRoot();
 
@@ -121,20 +156,10 @@ function assertSafeFallbackRoot() {
     }
     throw error;
   }
-  const stats = fs.lstatSync(root);
-
-  // Windows has no POSIX modes or uids: Node reports synthesized bits such as
-  // 0777 for an ordinary directory, so the mode test would reject the plugin's
-  // own fallback on every command after the one that created it. There
-  // os.tmpdir() is the per-user %TEMP%, which is what provides the isolation.
-  const posix = process.platform !== "win32" && process.getuid !== undefined;
-  const hostile =
-    stats.isSymbolicLink() ||
-    !stats.isDirectory() ||
-    (posix && stats.uid !== process.getuid()) ||
-    (posix && (stats.mode & 0o077) !== 0);
   // Loud on purpose: there is no safe way to continue automatically.
-  if (hostile) throw hostileRootError(root, "symlink, wrong owner, or group/other permissions");
+  if (!isPrivateDir(root, 0o077)) {
+    throw hostileRootError(root, "symlink, wrong owner, or group/other permissions");
+  }
 }
 
 // stderr, never stdout: callers parse stdout. Named cause — the whole defect was
@@ -156,7 +181,7 @@ function warnRelocated(candidate, resolved) {
 // (loadBrokerSession -> resolveBrokerStateFile -> here), where a throw skipped
 // broker shutdown and orphaned the detached app-server process and its socket.
 // Creation and validation belong to ensureStateDir, the single writer.
-function resolveStateRoot(pluginDataDir) {
+function resolveStateRootFor(pluginDataDir) {
   if (!pluginDataDir) return fallbackStateRoot();
 
   const candidate = path.join(pluginDataDir, "state");
@@ -167,6 +192,14 @@ function resolveStateRoot(pluginDataDir) {
   }
   if (resolved !== candidate) warnRelocated(candidate, resolved);
   return resolved;
+}
+
+// The directory every per-workspace state dir is a child of. Exported for the
+// SessionStart broker sweep, which enumerates SIBLING workspaces rather than
+// resolving one of them: re-deriving this root there would duplicate the
+// sandbox fallback — and its warn-once memo — that lives above.
+export function resolveStateRoot() {
+  return resolveStateRootFor(process.env[PLUGIN_DATA_ENV]);
 }
 
 function nowIso() {
@@ -195,8 +228,7 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const stateRoot = resolveStateRoot(process.env[PLUGIN_DATA_ENV]);
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return path.join(resolveStateRoot(), `${slug}-${hash}`);
 }
 
 export function resolveStateFile(cwd) {
@@ -228,7 +260,7 @@ export function ensureStateDir(cwd) {
   // validates. Covers the CLAUDE_PLUGIN_DATA-unset branch too, where the
   // fallback is the DEFAULT rather than the exception — validating only inside
   // the unwritable branch left that path completely unguarded.
-  if (resolveStateRoot(process.env[PLUGIN_DATA_ENV]) === fallbackStateRoot()) {
+  if (resolveStateRoot() === fallbackStateRoot()) {
     assertSafeFallbackRoot();
   }
 

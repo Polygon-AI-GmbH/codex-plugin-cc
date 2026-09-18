@@ -11,6 +11,7 @@ import {
   loadBrokerSession,
   PID_FILE_ENV,
   sendBrokerShutdown,
+  sweepOrphanedBrokerSessions,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
@@ -74,10 +75,21 @@ function cleanupSessionJobs(cwd, sessionId) {
   });
 }
 
-function handleSessionStart(input) {
+async function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+
+  // Reap brokers left behind by workspaces that no longer exist — review-gate
+  // snapshots, mostly. SessionEnd only ever tears down its OWN cwd's broker, so
+  // without this nothing collects the rest. Time-boxed and swallowed for the
+  // same reason the SessionEnd teardown is: the exports above are what this
+  // hook owes the session, and housekeeping must never delay or fail it.
+  try {
+    await sweepOrphanedBrokerSessions();
+  } catch {
+    // Ignore sweep failures — they cost a leaked broker, not a session.
+  }
 }
 
 async function handleSessionEnd(input) {
@@ -98,7 +110,10 @@ async function handleSessionEnd(input) {
   const pid = brokerSession?.pid ?? null;
 
   if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
+    // Bounded: hooks.json gives SessionEnd 5s, and a wedged broker that
+    // accepts but never answers would otherwise eat all of it and skip the
+    // teardown below.
+    await sendBrokerShutdown(brokerEndpoint, { timeoutMs: 2000 });
   }
 
   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
@@ -118,7 +133,7 @@ async function main() {
   const eventName = process.argv[2] ?? input.hook_event_name ?? "";
 
   if (eventName === "SessionStart") {
-    handleSessionStart(input);
+    await handleSessionStart(input);
     return;
   }
 

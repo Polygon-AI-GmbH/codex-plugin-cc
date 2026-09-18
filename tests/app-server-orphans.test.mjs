@@ -17,14 +17,7 @@ import { spawn } from "node:child_process";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
-const alive = (pid) => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-};
+import { alive } from "./helpers.mjs";
 
 /** Run `source` as a detached node process; return its pid and the child's. */
 async function runParent(source) {

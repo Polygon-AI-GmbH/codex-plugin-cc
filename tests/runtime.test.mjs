@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { SWEEP_ROOTS_ENV, loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -676,12 +676,15 @@ test("session start hook exports the Claude session id, transcript path, and plu
   const pluginDataDir = makeTempDir();
   const transcriptPath = path.join(repo, "session.jsonl");
 
+  // SessionStart sweeps orphaned broker records; pin its candidate roots to a
+  // temp dir so the subprocess never walks the developer's real fallback roots.
   const result = run("node", [SESSION_HOOK, "SessionStart"], {
     cwd: repo,
     env: {
       ...process.env,
       CLAUDE_ENV_FILE: envFile,
-      CLAUDE_PLUGIN_DATA: pluginDataDir
+      CLAUDE_PLUGIN_DATA: pluginDataDir,
+      [SWEEP_ROOTS_ENV]: makeTempDir()
     },
     input: JSON.stringify({
       hook_event_name: "SessionStart",

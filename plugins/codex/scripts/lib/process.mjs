@@ -55,7 +55,8 @@ function looksLikeMissingProcessMessage(text) {
 }
 
 export function terminateProcessTree(pid, options = {}) {
-  if (!Number.isFinite(pid)) {
+  // Strictly positive: `kill(-0)` is `kill(0)`, the caller's own process group.
+  if (!Number.isInteger(pid) || pid <= 0) {
     return { attempted: false, delivered: false, method: null };
   }
 

@@ -18,6 +18,22 @@ export function writeJsonFile(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+/**
+ * Is `dirPath` positively absent? True ONLY for ENOENT/ENOTDIR. `existsSync`
+ * answers false for EACCES/EPERM/EIO as well, and both the broker watchdog and
+ * the SessionStart sweep act on "gone" by shutting a broker down — a
+ * transiently unreadable workspace (a `chmod 000` parent, a hiccuping mount)
+ * must read as "still there", never as evidence of orphanhood.
+ */
+export function workspaceIsGone(dirPath) {
+  try {
+    fs.statSync(dirPath);
+    return false;
+  } catch (error) {
+    return error?.code === "ENOENT" || error?.code === "ENOTDIR";
+  }
+}
+
 export function safeReadFile(filePath) {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
 }
